@@ -1,0 +1,368 @@
+// စတိတ်ရှိုး Stage Show — live server
+// Runs on the streaming phone/PC (Termux). Serves the overlay + control panel, listens to a TikTok LIVE room,
+// keeps the list of seated audience members, generates Burmese MC voice lines with Edge TTS and pushes
+// everything to the overlay over WebSocket.
+//
+//   cd live && npm install && node server.mjs        → http://localhost:3000/live/control.html
+//
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import os from 'node:os';
+import { WebSocketServer } from 'ws';
+import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
+
+if (!AbortSignal.any) AbortSignal.any = signals => { const c = new AbortController(); for (const s of signals) { if (s.aborted) { c.abort(s.reason); break; } s.addEventListener('abort', () => c.abort(s.reason), { once: true }); } return c.signal; };
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, '..');            // repo root: serves /assets, /live
+const TTS_DIR = path.join(__dirname, 'tts');
+fs.mkdirSync(TTS_DIR, { recursive: true });
+for (const f of fs.readdirSync(TTS_DIR)) { try { fs.unlinkSync(path.join(TTS_DIR, f)); } catch {} }
+const PORT = +process.env.PORT || 3000;
+
+/* ------------------------------------------------------------------ state */
+const settings = {
+  title: 'စတိတ်ရှိုး Stage Show',
+  subtitle: 'ကြိုဆိုပါတယ် · အားပေးကြပါ 🎤',
+  voice: 'my-MM-NilarNeural',        // Burmese: my-MM-NilarNeural (female) / my-MM-ThihaNeural (male)
+  pitch: 0,                          // Hz
+  rate: 0,                           // %
+  music: true, mo: false, moBpm: 52,
+  performer: 'female',               // female | male singer on stage
+  track: 1,                          // background song: 1 | 2 | 3 (3 = uploaded custom song, session-only)
+  duoSync: 'auto', duoFirst: 'male', duoTurn: 15, duoDelay: 0,   // duet mic timing: auto = follow the analysed voice timeline of the uploaded song; manual = who sings first / when the first verse starts / seconds per solo turn
+  autoChant: true, chantEveryMin: 3,
+  seatMode: 'auto',                  // auto | 24 | 36 | 64 | 100
+  joinOnEnter: false,                // also seat viewers who only enter the room
+  gifts: { readAll: true, minDiamonds: 1 },
+};
+const viewers = new Map();           // id -> { id, name, skin, avatar, coins, joinedAt, lastAt, lastText, lastTextAt, demo }
+const startedAt = Date.now();
+let tiktok = null, tiktokState = { status: 'idle', uniqueId: '', error: '' };
+const log = [];
+function addLog(s){ const line = `[${new Date().toLocaleTimeString('my-MM')}] ${s}`; log.push(line); if (log.length > 300) log.shift(); broadcast({ t:'log', line }, 'control'); console.log(line); }
+
+const CAPS = [24, 36, 64, 100];
+function capacity(){ if (settings.seatMode !== 'auto') return +settings.seatMode; const n = viewers.size; return CAPS.find(c => n <= c) || 100; }
+
+/* skins: sprites that exist in /assets. Walking strips exist for man / woman / granny. */
+// A comment changes the outfit only when it IS the keyword (≤ 3 words), so a long cheer never reads as an outfit word.
+const SKIN_WORDS = [
+  ['master', ['vip','ဗီအိုင်ပီ','ဆရာကြီး']], ['monk', ['ဘုန်းကြီး','ဆရာတော်']], ['nun', ['သီလရှင်','ဆရာလေး']],
+  ['child', ['ကလေး','ကိုရင်','boy','girl']], ['granny', ['အဘွား','အဖွား']],
+  ['woman', ['မိန်းကလေး','အမျိုးသမီး','မမ','woman']], ['man', ['ယောက်ျား','အမျိုးသား','ကိုကို','man']],
+];
+function skinFromText(t){
+  const w = String(t).toLowerCase().normalize('NFC').replace(/[^\p{L}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+  if (!w || w.split(' ').length > 3) return null;
+  for (const [skin, words] of SKIN_WORDS) if (words.some(k => w === k || w.startsWith(k + ' '))) return skin;
+  return null;
+}
+const DEFAULT_SKINS = ['man', 'woman', 'woman', 'man'];
+
+function pub(v){ return { id:v.id, name:v.name, skin:v.skin, avatar:v.avatar||'', coins:v.coins, demo:!!v.demo }; }
+function snapshot(){ return { t:'state', settings, viewers:[...viewers.values()].map(pub), cap: capacity(), startedAt, tiktok: tiktokState, timeline: customTimeline }; }
+
+function seat(id, name, opts = {}){
+  let v = viewers.get(id);
+  if (v){ v.lastAt = Date.now(); if (opts.avatar) v.avatar = opts.avatar; return { v, isNew:false }; }
+  if (viewers.size >= 100){                     // full: the longest-quiet non-donor stands up
+    const quiet = [...viewers.values()].filter(x => x.coins === 0).sort((a,b) => a.lastAt - b.lastAt)[0];
+    if (!quiet) return { v:null, isNew:false };
+    viewers.delete(quiet.id); broadcast({ t:'leave', id: quiet.id });
+  }
+  v = { id, name: (name||id).slice(0, 18), skin: opts.skin || DEFAULT_SKINS[viewers.size % DEFAULT_SKINS.length],
+        avatar: opts.avatar || '', coins: 0, joinedAt: Date.now(), lastAt: Date.now(), demo: !!opts.demo };
+  viewers.set(id, v);
+  broadcast({ t:'join', v: pub(v), cap: capacity() });
+  return { v, isNew:true };
+}
+
+/* ------------------------------------------------------------- events in */
+function onChat(id, name, text, avatar){
+  text = String(text || '').slice(0, 120);
+  const want = skinFromText(text);
+  const { v, isNew } = seat(id, name, { avatar, skin: want || undefined });
+  if (!v) return;
+  if (!isNew && want && want !== v.skin){ v.skin = want; broadcast({ t:'skin', id, skin: want }); }
+  v.lastText = text; v.lastTextAt = Date.now();
+  broadcast({ t:'chat', id, name: v.name, text });
+}
+
+/* TikTok gift catalog (guide values): English name (as TikTok reports it) -> Burmese label + emoji + coins */
+const GIFT_CATALOG = [
+  { en:'TikTok Universe', my:'ယူနီဗာစ်', emoji:'🪐', coins:44999 },
+  { en:'Lion', my:'ခြင်္သေ့', emoji:'🦁', coins:29999 },
+  { en:'Rosa Nebula', my:'နက်ဗျူလာ', emoji:'💫', coins:15000 },
+  { en:'Interstellar', my:'အင်တာစတယ်လာ', emoji:'🚀', coins:10000 },
+  { en:'Sports Car', my:'စပোর্ঐ်ကား', emoji:'🏎️', coins:7000 },
+  { en:'Flying Jets', my:'ဂျက်လေယာဉ်', emoji:'✈️', coins:5000 },
+  { en:'Leon the Kitten', my:'ကြောင်လေး', emoji:'🐱', coins:4888 },
+  { en:'Meteor Shower', my:'ဥက္ကာပျံ', emoji:'☄️', coins:3000 },
+  { en:'Whale Diving', my:'ဝေလငါး', emoji:'🐳', coins:2150 },
+  { en:'Galaxy', my:'ဂလက်ဆီ', emoji:'🌌', coins:1000 },
+  { en:'Swan', my:'ဟင်္သာ', emoji:'🦢', coins:699 },
+  { en:'Money Gun', my:'ပိုက်ဆံသေနတ်', emoji:'💸', coins:500 },
+  { en:'Corgi', my:'ကော်ဂီ', emoji:'🐶', coins:299 },
+  { en:'Hearts', my:'အသဲများ', emoji:'💖', coins:199 },
+  { en:'Hand Heart', my:'လက်အသဲ', emoji:'🫶', coins:100 },
+  { en:'Doughnut', my:'ဒိုးနတ်', emoji:'🍩', coins:30 },
+  { en:'Rosa', my:'ရိုဆာ', emoji:'🌷', coins:10 },
+  { en:'Rose', my:'နှင်းဆီ', emoji:'🌹', coins:1 },
+  { en:'Heart Me', my:'အသဲပေး', emoji:'🧡', coins:1 },
+  { en:'Crown', my:'သရဖူ', emoji:'👑', coins:199 },
+  { en:'Bouquet', my:'ပန်းစည်း', emoji:'💐', coins:30 },
+];
+function onGift(id, name, giftName, count, diamonds, avatar){
+  giftName = String(giftName || 'လက်ဆောင်').slice(0, 30); count = Math.max(1, Math.min(9999, +count || 1));
+  const gInfo = GIFT_CATALOG.find(g => g.en === giftName || g.my === giftName) || null;
+  const gLabel = gInfo ? gInfo.my : giftName, gEmoji = gInfo ? gInfo.emoji : '🎁';
+  const { v } = seat(id, name, { avatar });
+  if (!v) return;
+  const coins = Math.max(1, (diamonds || 1) * (count || 1));
+  v.coins += coins;
+  const prayer = (v.lastText && Date.now() - v.lastTextAt < 90_000 && v.lastText.length > 6) ? v.lastText : pickThanks();
+  const tier = coins >= 99 ? 3 : coins >= 10 ? 2 : 1;
+  const line = `ကျေးဇူးအများကြီး တင်ပါတယ်။ ${spoken(v.name)} မှ ${gLabel} ကို${count > 1 ? ' ' + count + ' ကြိမ်' : ''} ပို့ပြီး အားပေးသွားပါတယ်။ ${prayer}`;
+  broadcast({ t:'gift', id, name: v.name, giftName: gLabel, emoji: gEmoji, count, coins, total: v.coins, tier, prayer });
+  if (settings.gifts.readAll || coins >= settings.gifts.minDiamonds) say(line, { tag:'gift', id });
+}
+
+function pickThanks(){
+  const P = ['အားပေးမှုအတွက် အထူး ကျေးဇူးတင်ပါတယ်', 'ပျော်ရွှင်စရာ အချိန်လေး ဖြစ်ပါစေ', 'နောက်လည်း အမြဲ အားပေးကြပါ', 'အားလုံး ပျော်ရွှင်ကြပါစေ', 'ကျန်းမာ ချမ်းသာကြပါစေ'];
+  return P[Math.floor(Math.random() * P.length)];
+}
+const spoken = s => String(s).replace(/[_@.]+/g, ' ').replace(/[^\p{L}\p{N}\s]/gu, '').trim() || 'အမည်မသိ';
+
+/* ------------------------------------------------------------------ TTS */
+const ttsQueue = []; let ttsBusy = false, ttsSeq = 0;
+function esc(s){ return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[c])); }
+function say(text, meta = {}){ if (ttsQueue.length >= 15) { addLog('အသံ တန်းစီ ပြည့်နေလို့ တစ်ကြောင်း ကျော်လိုက်တယ်'); return; } ttsQueue.push({ text: String(text).slice(0, 500), meta }); pumpTTS(); }
+async function pumpTTS(){
+  if (ttsBusy || !ttsQueue.length) return; ttsBusy = true;
+  const { text, meta } = ttsQueue.shift();
+  try {
+    const file = `tts_${Date.now()}_${++ttsSeq}.mp3`;
+    const tts = new MsEdgeTTS();
+    await tts.setMetadata(settings.voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+    const { audioStream } = tts.toStream(esc(text), { pitch: `${settings.pitch >= 0 ? '+' : ''}${settings.pitch}Hz`, rate: `${settings.rate >= 0 ? '+' : ''}${settings.rate}%` });
+    const chunks = [];
+    await new Promise((res, rej) => { audioStream.on('data', c => chunks.push(c)); audioStream.on('close', res); audioStream.on('error', rej); });
+    try { tts.close(); } catch {}
+    fs.writeFileSync(path.join(TTS_DIR, file), Buffer.concat(chunks));
+    broadcast({ t:'tts', url: `/live/tts/${file}`, text, ...meta });
+    const old = fs.readdirSync(TTS_DIR).sort(); while (old.length > 40) { try { fs.unlinkSync(path.join(TTS_DIR, old.shift())); } catch {} }
+  } catch (e) { addLog('TTS အမှား: ' + (e?.message || e)); }
+  ttsBusy = false; setTimeout(pumpTTS, 50);
+}
+
+const CHANTS = [
+  'စတိတ်ရှိုး Live မှ ကြိုဆိုပါတယ်။ Comment တစ်ခုခု ရေးလိုက်တာနဲ့ ပရိသတ်ခုံမှာ ဝင်ထိုင်ပြီး အတူ ကြည့်လို့ ရပါတယ်။',
+  'Gift ပို့ပြီး အားပေးသူအားလုံးကို အထူး ကျေးဇူးတင်ပါတယ်။',
+  'Like လေးတွေ နှိပ်ပြီး အားပေးကြပါဦး။ အားလုံး ပျော်ရွှင်ကြပါစေ။',
+  'ဝတ်စုံ ပြောင်းချင်ရင် ယောက်ျား၊ မိန်းကလေး၊ အဘွား၊ ကလေး လို့ Comment ရေးပါ။',
+];
+let chantIdx = 0, chantTimer = null;
+function chant(){ const text = CHANTS[chantIdx++ % CHANTS.length]; broadcast({ t:'chant', text }); say(text, { tag:'chant' }); }
+function scheduleChant(){ clearInterval(chantTimer); if (settings.autoChant) chantTimer = setInterval(chant, Math.max(1, settings.chantEveryMin) * 60_000); }
+scheduleChant();
+
+/* --------------------------------------------------------------- TikTok */
+let TikTokLib = null;
+async function connectTikTok(uniqueId){
+  uniqueId = String(uniqueId || '').trim().replace(/^.*tiktok\.com\/@?/i, '').replace(/^@/, '').replace(/\/.*$/, '');
+  if (!uniqueId) return;
+  await disconnectTikTok();
+  tiktokState = { status: 'connecting', uniqueId, error: '' }; broadcast({ t:'tiktok', ...tiktokState });
+  try {
+    TikTokLib ||= await import('ttl-live');
+    const { TikTokLive } = TikTokLib;
+    const conn = new TikTokLive('@' + uniqueId);
+    const nm = u => u?.nickname || u?.uniqueId || 'အမည်မသိ';
+    const uid = u => u?.uniqueId || u?.userId;
+    conn.on('chat', d => onChat(uid(d.user), nm(d.user), d.comment, d.user?.avatarUrl || ''));
+    conn.on('gift', d => {
+      if (d.streakable && !d.repeatEnd) return;                     // streak still running
+      const gname = d.giftName || 'လက်ဆောင်';
+      onGift(uid(d.user), nm(d.user), gname, d.repeatCount || 1, d.diamondCount ?? 1, d.user?.avatarUrl || '');
+      addLog(`🎁 ${nm(d.user)} က ${gname} x${d.repeatCount || 1} ပို့တယ်`);
+    });
+    conn.on('member', d => { if (settings.joinOnEnter) seat(uid(d.user), nm(d.user), { avatar: d.user?.avatarUrl || '' }); });
+    conn.on('like', d => broadcast({ t:'like', id: uid(d.user), n: d.likeCount || 1 }));
+    conn.on('connected', () => { if (tiktok === conn && tiktokState.status !== 'connected'){ tiktokState = { ...tiktokState, status: 'connected', error: '' }; broadcast({ t:'tiktok', ...tiktokState }); addLog('✅ TikTok ပြန်ချိတ်ဆက်ပြီးပြီ'); } });
+    conn.on('disconnected', () => { if (tiktok === conn){ tiktokState = { ...tiktokState, status: 'disconnected' }; broadcast({ t:'tiktok', ...tiktokState }); addLog('TikTok: ချိတ်ဆက်မှု ပြတ်သွားတယ်'); } });
+    conn.on('error', e => addLog('TikTok အမှား: ' + (e?.message || e)));
+    await conn.connect();
+    tiktok = conn;
+    tiktokState = { status: 'connected', uniqueId, error: '', roomId: '' };
+    addLog(`✅ Live @${uniqueId} နဲ့ ချိတ်ဆက်ပြီးပြီ`);
+  } catch (e) {
+    tiktokState = { status: 'error', uniqueId, error: String(e?.message || e) };
+    addLog(`❌ @${uniqueId} နဲ့ ချိတ်ဆက်မရပါ: ${tiktokState.error}`);
+    if (/timeout|aborted/i.test(tiktokState.error)) addLog('💡 အချိန် ကုန်သွားတယ် — LIVE ဖွင့်ထားတာ သေချာလား၊ network/VPN စစ်ပြီး ထပ်ကြိုးစားပါ');
+  }
+  broadcast({ t:'tiktok', ...tiktokState });
+}
+async function disconnectTikTok(){ if (tiktok){ try { tiktok.disconnect(); } catch {} tiktok = null; } tiktokState = { status:'idle', uniqueId:'', error:'' }; broadcast({ t:'tiktok', ...tiktokState }); }
+
+/* ------------------------------------------------------------- test data */
+const DEMO_NAMES = ['သူရိန်','မေသူ','ခင်လေး','အေးမြတ်','စိုးစိုး','နှင်းနှင်း','ကျော်ကျော်','ဇင်မာ','ဖြူဖြူ','သက်ထား','ဝင်းဝင်း','မိုးမိုး','စံပယ်','ချယ်ရီ','နန်းနန်း','ထွန်းထွန်း','လဲ့လဲ့','ဆုဆု','ခိုင်ခိုင်','မျိုးမျိုး','ဥမ္မာ','သဲသဲ','အိအိ','ထူးထူး','ပိုင်ပိုင်','ရဲရဲ','စန္ဒာ','သော်တာ','မြတ်နိုး','အေးအေး','ကိုကို','မမ'];
+function fillDemo(n, skin){
+  const have = [...viewers.values()].filter(v => v.demo).length;
+  for (let i = have; i < n && viewers.size < 100; i++){
+    const name = DEMO_NAMES[i % DEMO_NAMES.length] + (i >= DEMO_NAMES.length ? ' ' + (Math.floor(i / DEMO_NAMES.length) + 1) : '');
+    seat('demo_' + i, name, { demo: true, skin: skin || ['man','woman','woman','man'][i % 4] });
+  }
+}
+function clearSeats(){ viewers.clear(); broadcast(snapshot()); addLog('ပရိသတ်ခုံ အားလုံး ရှင်းလိုက်ပြီ'); }
+
+/* ------------------------------------------------------------- control */
+const ctlSkin = m => (m.skin === 'man' || m.skin === 'woman') ? m.skin : undefined;
+function applyCtlSkin(id, m){ const sk = ctlSkin(m); if (!sk) return; const v = viewers.get(id); if (v && v.skin !== sk){ v.skin = sk; broadcast({ t:'join', v: pub(v), cap: capacity() }); } }
+function onControl(m){
+  switch (m.cmd){
+    case 'connect': connectTikTok(m.uniqueId); break;
+    case 'disconnect': disconnectTikTok(); addLog('TikTok ချိတ်ဆက်မှု ဖြုတ်လိုက်ပြီ'); break;
+    case 'chat': { const n = String(m.name || 'ပရိသတ်').slice(0, 18); onChat('sim_' + n, n, String(m.text || 'အရမ်းမိုက်တယ် 👏').slice(0, 120)); applyCtlSkin('sim_' + n, m); break; }
+    case 'gift': { const n = String(m.name || 'ပရိသတ်').slice(0, 18); onGift('sim_' + n, n, String(m.gift || 'နှင်းဆီ').slice(0, 30), clamp(m.count, 1, 99), clamp(m.diamonds, 1, 50000)); applyCtlSkin('sim_' + n, m); break; }
+    case 'fill': fillDemo(clamp(m.n, 1, 100), ctlSkin(m)); addLog(`လူအတု ထည့်ပြီး: ${viewers.size} ယောက်`); break;
+    case 'clear': clearSeats(); break;
+    case 'bell': broadcast({ t:'bell' }); break;
+    case 'intro': broadcast({ t:'intro' }); break;
+    case 'timeline': { customTimeline = Array.isArray(m.segments) ? m.segments.slice(0, 2000).map(s => ({ a: Math.max(0, +s.a || 0), b: Math.max(0, +s.b || 0), w: ['m','f','b'].includes(s.w) ? s.w : 'm' })).filter(s => s.b > s.a) : null; broadcast({ t:'timeline', segments: customTimeline }); if (customTimeline) addLog('အဆိုတော် အလှည့် (auto) တွက်ပြီးပြီ — ' + customTimeline.length + ' ပိုင်း'); break; }
+    case 'mo': broadcast({ t:'mo1' }); break;
+    case 'chant': chant(); break;
+    case 'say': if (m.text) say(String(m.text).slice(0, 400), { tag:'say' }); break;
+    case 'settings':
+      applySettings(m.settings || {});
+      scheduleChant(); broadcast({ t:'settings', settings, cap: capacity() }); break;
+    case 'bots': setBots(!!m.on, +m.n || 12, m.pace, ctlSkin(m)); break;
+  }
+}
+
+// Only known keys, right types, sane ranges: the panel is local, but nothing from the socket is trusted blindly.
+const SETTING_RULES = {
+  title: v => String(v).slice(0, 40), subtitle: v => String(v).slice(0, 60),
+  voice: v => ['my-MM-NilarNeural', 'my-MM-ThihaNeural'].includes(v) ? v : settings.voice,
+  pitch: v => clamp(v, -50, 50), rate: v => clamp(v, -50, 50), moBpm: v => clamp(v, 20, 120), chantEveryMin: v => clamp(v, 1, 60),
+  music: Boolean, mo: Boolean, autoChant: Boolean, joinOnEnter: Boolean,
+  seatMode: v => ['auto', '24', '36', '64', '100'].includes(String(v)) ? String(v) : 'auto',
+  performer: v => ['female', 'male', 'duo'].includes(v) ? v : settings.performer,
+  track: v => [1, 2, 3].includes(+v) ? +v : settings.track,
+  duoSync: v => ['auto', 'manual'].includes(v) ? v : settings.duoSync,
+  duoFirst: v => ['male', 'female'].includes(v) ? v : settings.duoFirst,
+  duoTurn: v => clamp(v, 5, 60), duoDelay: v => clamp(v, 0, 60),
+};
+const clamp = (v, a, b) => Math.max(a, Math.min(b, Math.round(+v || 0)));
+function applySettings(o){ for (const [k, fn] of Object.entries(SETTING_RULES)) if (k in o) settings[k] = fn(o[k]); }
+
+/* ----------------------------------------------------------------- bots */
+let botTimer = null;
+const BOT_LINES = ['အရမ်းမိုက်တယ် 👏', 'နောက်တစ်ပုဒ်! နောက်တစ်ပုဒ်!', 'အားပေးနေတယ် ❤️', 'မိန်းကလေး', 'ယောက်ျား', 'အဘွား',
+  'အသံက ကောင်းလိုက်တာ', 'အားလုံး ပျော်ရွှင်ကြပါစေ', 'ကလေး', 'Like လုပ်ထားတယ် 👍', 'ပျော်စရာကြီး', 'ကျေးဇူးပါ'];
+function setBots(on, n, pace, skin){
+  clearInterval(botTimer); botTimer = null;
+  if (on){
+    n = clamp(n, 1, 100);
+    for (const id of [...viewers.keys()]) if (id.startsWith('bot_')) { viewers.delete(id); broadcast({ t:'leave', id }); }
+    for (let i = 0; i < n; i++) seat('bot_' + i, DEMO_NAMES[(i + 7) % DEMO_NAMES.length] + ' ·bot', { demo: true, ...(skin ? { skin } : {}) });
+    const every = { slow: 4000, mid: 1800, fast: 700 }[pace] || 1800;
+    botTimer = setInterval(() => {
+      const ids = [...viewers.keys()].filter(id => id.startsWith('bot_')); if (!ids.length) return;
+      const id = ids[Math.floor(Math.random() * ids.length)], v = viewers.get(id), r = Math.random();
+      if (r < .62) onChat(id, v.name, BOT_LINES[Math.floor(Math.random() * BOT_LINES.length)]);
+      else if (r < .9) broadcast({ t:'like', id, n: 1 + Math.floor(Math.random() * 4) });
+      else if (r < .985) onGift(id, v.name, 'နှင်းဆီ', 1 + Math.floor(Math.random() * 3), 1);
+      else onGift(id, v.name, 'သရဖူ', 1, 99);
+    }, every);
+    addLog(`🤖 Bot ${n} ခု ဖွင့်ပြီး, အရှိန် ${pace}`);
+  } else {
+    for (const id of [...viewers.keys()]) if (id.startsWith('bot_')) { viewers.delete(id); broadcast({ t:'leave', id }); }
+    addLog('🤖 Bot ပိတ်လိုက်ပြီ');
+  }
+  broadcast({ t:'bots', on }, 'control');
+}
+
+/* -------------------------------------------------------------- server */
+// Security notes (this file is meant to be shared publicly):
+//  • listens on all interfaces so the control panel can be opened from another device on the SAME
+//    Wi-Fi (e.g. a second phone) while the streaming phone only shows the overlay; not reachable from
+//    the internet (no port forwarding), but anyone on the same Wi-Fi can open the control panel —
+//    use it on a trusted home network only
+//  • Host header must be localhost/127.0.0.1 or a private LAN address (blocks DNS-rebinding pages)
+//  • WebSocket only accepts pages served by this server (Origin check), so other sites open in the
+//    same browser cannot send control commands
+//  • static files: only /assets and /live, no dot-files, no node_modules, no server source, no path escapes
+//  • no TikTok password, cookie or session is ever used or stored; only public room events are read
+const HOST = process.env.HOST || '0.0.0.0';
+const MIME = { '.html':'text/html; charset=utf-8', '.js':'text/javascript', '.css':'text/css', '.json':'application/json',
+  '.png':'image/png', '.jpg':'image/jpeg', '.webp':'image/webp', '.mp3':'audio/mpeg', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
+const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]);
+const PRIVATE_HOST = /^(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})$/;
+const okHost = h => { h = String(h || '').toLowerCase(); return ALLOWED_HOSTS.has(h) || (h.endsWith(':' + PORT) && PRIVATE_HOST.test(h.slice(0, -String(PORT).length - 1))); };
+const SEP = path.sep;
+function resolveStatic(urlPath){
+  let p = urlPath === '/' ? '/live/control.html' : urlPath;
+  if (!/^\/(assets|live)\//.test(p)) return null;
+  if (p.split('/').some(seg => seg.startsWith('.') || seg === 'node_modules')) return null;
+  if (/\.(mjs|json|md|log)$/i.test(p) && !p.startsWith('/assets/')) return null;      // never serve server code / package files
+  const file = path.normalize(path.join(ROOT, p));
+  if (!file.startsWith(ROOT + SEP)) return null;
+  return file;
+}
+/* Custom background song (Track 3): session-only — kept in memory, never written to disk.
+   When the server (Termux) stops, it is gone; a restart starts with Track 3 empty again. */
+let customSong = null;
+let customTimeline = null;   // duet auto-sync: [{a,b,w}] sung segments of the uploaded song (w: m|f|b), session-only like the song itself
+try { fs.unlinkSync(path.join(ROOT, 'assets', 'music', 'custom.mp3')); } catch {}   // drop any file saved by older versions
+const server = http.createServer((req, res) => {
+  if (!okHost(req.headers.host)) { res.writeHead(421).end('wrong host'); return; }
+  let p; try { p = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { res.writeHead(400).end(); return; }
+  if (req.method === 'POST' && p === '/live/upload-music') {          // control panel uploads a custom background song
+    const chunks = []; let size = 0, aborted = false;
+    req.on('data', c => { size += c.length; if (size > 25 * 1024 * 1024) { aborted = true; req.destroy(); } else chunks.push(c); });
+    req.on('end', () => { if (aborted) return;
+      customSong = Buffer.concat(chunks); customTimeline = null; broadcast({ t:'timeline', segments: null });
+      settings.track = 3; broadcast({ t:'settings', settings, cap: capacity() }); broadcast({ t:'newsong' });
+      addLog('ကိုယ်ပိုင်သီချင်း တင်ပြီးပြီ (ယာယီ — Termux ပိတ်ရင် ပျောက်မယ်) — သီချင်း ၃ ရွေးထားတယ်');
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"ok":true}'); });
+    return; }
+  if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405).end(); return; }
+  if (p === '/assets/music/custom.mp3') {          // session-only custom song, served from memory
+    if (!customSong) { res.writeHead(404).end('not found'); return; }
+    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': customSong.length, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+    if (req.method === 'HEAD') { res.end(); return; }
+    res.end(customSong); return; }
+  const file = resolveStatic(p);
+  if (!file) { res.writeHead(404).end('not found'); return; }
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) { res.writeHead(404).end('not found'); return; }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
+      'Cache-Control': p.startsWith('/live/tts/') ? 'no-store' : 'no-cache', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+    if (req.method === 'HEAD') { res.end(); return; }
+    fs.createReadStream(file).pipe(res);
+  });
+});
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024,
+  verifyClient: ({ origin, req }) => {
+    if (!okHost(req.headers.host)) return false;
+    if (!origin) return true;                                   // OBS / non-browser clients send no Origin
+    try { return okHost(new URL(origin).host); } catch { return false; }
+  } });
+function broadcast(msg, only){ const s = JSON.stringify(msg); for (const c of wss.clients) if (c.readyState === 1 && (!only || c.role === only)) c.send(s); }
+wss.on('connection', (ws, req) => {
+  ws.role = new URL(req.url, 'http://x').searchParams.get('role') === 'control' ? 'control' : 'overlay';
+  ws.send(JSON.stringify(snapshot()));
+  if (ws.role === 'control') ws.send(JSON.stringify({ t:'logs', lines: log }));
+  ws.on('message', buf => {
+    if (ws.role !== 'control') return;                          // overlays only listen
+    try { const m = JSON.parse(buf); if (m && m.t === 'ctl') onControl(m); } catch (e) { addLog('အမိန့် အမှား: ' + e.message); }
+  });
+});
+if (parseInt(process.versions.node) < 22) addLog(`⚠️ Node ${process.versions.node} — ttl-live က Node 22+ မှာ အကောင်းဆုံးပါ`);
+server.listen(PORT, HOST, () => {
+  addLog(`Server လည်နေပြီ http://localhost:${PORT}  ·  Control: http://localhost:${PORT}/live/control.html  ·  Overlay: http://localhost:${PORT}/live/overlay.html`);
+  for (const addrs of Object.values(os.networkInterfaces())) for (const a of addrs || []) if (a.family === 'IPv4' && !a.internal) addLog(`📱 နောက် device (Wi-Fi တူရမယ်) ကနေ Control: http://${a.address}:${PORT}/live/control.html`);
+});
