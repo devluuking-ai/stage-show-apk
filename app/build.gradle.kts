@@ -12,8 +12,8 @@ android {
         applicationId = "com.devluuking.stageshow"
         minSdk = 29
         targetSdk = 34
-        versionCode = 36
-        versionName = "36.0"
+        versionCode = 37
+        versionName = "37.0"
         ndk {
             abiFilters += "arm64-v8a"
         }

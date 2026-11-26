@@ -105,6 +105,9 @@ if (window.visualViewport) { visualViewport.addEventListener('resize', fit); vis
 fit();
 function goFullscreen(){ try { const p = document.documentElement.requestFullscreen(); if (p && p.then) p.then(() => { try { const l = screen.orientation && screen.orientation.lock && screen.orientation.lock('portrait'); if (l && l.catch) l.catch(()=>{}); } catch(_){} }).catch(()=>{}); } catch(_){} }
 document.getElementById('fsBtn').onclick = () => goFullscreen();
+// Inside the APK's WebView the app's own ⛶ အပြည့် button owns fullscreen (HTML fullscreen is a
+// no-op there), and viewers would see this stray button in the Mobile gaming capture — hide it.
+if (/; wv\)/.test(navigator.userAgent)) document.getElementById('fsBtn').style.display = 'none';
 
 /* ======================= assets ======================= */
 const A = {};

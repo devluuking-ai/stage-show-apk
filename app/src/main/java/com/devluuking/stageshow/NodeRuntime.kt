@@ -14,7 +14,7 @@ import java.net.URL
  */
 object NodeRuntime {
     private const val TAG = "NodeRuntime"
-    private const val ASSET_VERSION = "stage-v36"
+    private const val ASSET_VERSION = "stage-v37"
 
     @Volatile var started = false
         private set

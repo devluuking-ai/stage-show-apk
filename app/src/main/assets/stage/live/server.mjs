@@ -361,7 +361,8 @@ wss.on('connection', (ws, req) => {
     try { const m = JSON.parse(buf); if (m && m.t === 'ctl') onControl(m); } catch (e) { addLog('အမိန့် အမှား: ' + e.message); }
   });
 });
-if (parseInt(process.versions.node) < 22) addLog(`⚠️ Node ${process.versions.node} — ttl-live က Node 22+ မှာ အကောင်းဆုံးပါ`);
+// APK copy: the embedded nodejs-mobile runtime is fixed at Node 18.20.4, and ttl-live's signer
+// is verified working on it (AbortSignal.any polyfill above), so no Node-version warning here.
 server.listen(PORT, HOST, () => {
   addLog(`Server လည်နေပြီ http://localhost:${PORT}  ·  Control: http://localhost:${PORT}/live/control.html  ·  Overlay: http://localhost:${PORT}/live/overlay.html`);
   for (const addrs of Object.values(os.networkInterfaces())) for (const a of addrs || []) if (a.family === 'IPv4' && !a.internal) addLog(`📱 နောက် device (Wi-Fi တူရမယ်) ကနေ Control: http://${a.address}:${PORT}/live/control.html`);
